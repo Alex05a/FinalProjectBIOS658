@@ -1,0 +1,1373 @@
+---
+title: "FINAL PROJECT - COVID-19 RNA-seq Analysis"
+author: "Alexandra Gerveni"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+# Global chunk options - this controls ALL chunks
+knitr::opts_chunk$set(
+  echo = FALSE,        # Hide code
+
+  message = FALSE,     # Hide messages
+  warning = FALSE,     # Hide warnings
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+# Introduction
+
+The COVID-19 pandemic has affected millions of people worldwide since late 2019. Understanding why some patients develop severe symptoms while others remain asymptomatic requires examining the cellular response to SARS-CoV-2 infection. RNA sequencing (RNA-seq) allows us to measure gene expression changes across thousands of genes simultaneously, helping identify the biological processes involved in the host immune response.
+
+Lieberman et al. (2020) analyzed nasopharyngeal swab samples from COVID-19 patients in Washington State using RNA-seq [@lieberman2020vivo]. They found that SARS-CoV-2 infection triggers a strong interferon-driven antiviral response (OAS1-3, IFIT1-3, CXCL9-11) and downregulation of ribosomal protein genes, suggesting viral disruption of host protein synthesis.
+
+For this project, I reanalyzed the publicly available dataset (GSE152075) from their study, which includes 484 samples (430 COVID-positive and 54 controls). The main research question was: What genes and pathways are differentially expressed in COVID-19 patients compared to healthy controls, and do my results align with the original study?
+While the original study used DESeq2, I used edgeR [@robinson2010edger], SVA for batch correction [@leek2012sva], and clusterProfiler for functional enrichment [@yu2012clusterprofiler]. My aims were to: (1) assess data quality, (2) preprocess and normalize the data, (3) identify differentially expressed genes, and (4) conduct pathway analysis. Replicating findings with different methods helps demonstrate that key biological conclusions are robust across statistical approaches.
+
+
+# Methods
+
+## Data 
+
+The RNA-seq dataset (GSE152075) was downloaded from NCBI Gene Expression Omnibus (GEO). This dataset from Lieberman et al. (2020) contains raw gene expression counts from 484 nasopharyngeal swab samples (430 COVID-positive and 54 controls) [@lieberman2020vivo]. COVID-19 status was extracted from sample names in the count matrix.
+
+## Quality Assessment
+
+Data quality was assessed before analysis. Library sizes were calculated and visualized using bar plots and box plots. Log-CPM distributions were checked using density plots to identify outlier samples. Sample correlations were shown as a heatmap using 50 randomly selected samples. MDS and PCA were used to assess sample clustering by COVID status and identify potential batch effects.
+
+## Preprocessing
+
+Lowly expressed genes were filtered using `filterByExpr`, keeping genes with at least 10 counts in a minimum number of samples. This reduced the gene count from 35,784 to 11,284 (~68% removed). TMM normalization was applied using edgeR to adjust for library size and RNA composition differences [@robinson2010edger].
+
+## Batch Effect Correction
+
+Since no batch information was available, Surrogate Variable Analysis (SVA) was used to identify hidden sources of variation [@leek2012sva]. SVA identified 4 surrogate variables, which were included as covariates in the differential expression model. PCA plots before and after correction using `removeBatchEffect` from limma were compared to assess improvement [@ritchie2015limma]. Hierarchical clustering on the top 10% most variable genes (1,128 genes) was also compared before and after correction.
+
+## Differential Expression Analysis
+
+Differential expression analysis was performed using edgeR's quasi-likelihood framework [@robinson2010edger]. The design matrix included COVID status as the main variable and the 4 SVA surrogate variables as covariates. Dispersions were estimated using `estimateDisp`, and a quasi-likelihood model was fitted using `glmQLFit`. Differential expression was tested using `glmQLFTest`. The Benjamini-Hochberg method controlled FDR, with significance thresholds of FDR < 0.05 and |log2FC| > 1. Results were compared with Lieberman et al. findings and visualized using volcano plots, box plots, and heatmaps.
+
+## Functional Enrichment Analysis
+
+Functional enrichment was performed using clusterProfiler [@yu2012clusterprofiler] with two approaches.
+
+**Overrepresentation Analysis (ORA):** Tests whether biological categories contain more DE genes than expected by chance. ORA was run for GO terms (BP, MF, CC) and KEGG pathways using genes passing FDR < 0.05 and |log2FC| > 1, with all expressed genes as background. Separate analyses were run for upregulated and downregulated genes.
+
+**Gene Set Enrichment Analysis (GSEA):** Uses all genes ranked by fold change to test whether pathway genes cluster at the top or bottom of the ranked list. GSEA was run for GO terms and KEGG pathways. Results with FDR < 0.05 were considered significant.
+
+## Software and Packages
+
+All analyses were performed in R version 4.x [@r2024]. The main packages used were: edgeR for differential expression [@robinson2010edger], limma for batch correction [@ritchie2015limma], sva for surrogate variable analysis [@leek2012sva], clusterProfiler for enrichment analysis [@yu2012clusterprofiler], org.Hs.eg.db for gene ID conversion [@carlson2019orghs], pheatmap for heatmaps [@pheatmap2019], and ggplot2 [@wickham2016ggplot2] with ggrepel [@ggrepel2021] for visualization.
+
+# Results
+
+## Quality Assessment
+
+The dataset contains 35,784 genes and 484 samples - 430 COVID-positive and 54 controls.
+
+## Data Loading
+```{r load-packages}
+# Load required packages
+library(edgeR)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+```
+
+```{r load-data}
+# Load the counts matrix
+counts <- read.delim("C:/Users/gervenia/OneDrive - Virginia Commonwealth University/Desktop/FINAL PROJECT 2025/GSE152075_raw_counts_GEO.txt/GSE152075_raw_counts_GEO.txt", 
+                     sep = " ",
+                     row.names = 1)
+```
+
+```{r create-metadata}
+# Create metadata from sample names
+metadata <- data.frame(
+  sample_id = colnames(counts),
+  condition = ifelse(grepl("^POS", colnames(counts)), "COVID", "Control"),
+  row.names = colnames(counts)
+)
+```
+
+```{r create-dge}
+# Create DGEList object
+dge <- DGEList(counts = counts, group = metadata$condition)
+```
+
+## Library Size Distribution
+```{r lib-size-data}
+# Prepare library size data
+# I'm creating a data frame to store the library size info for each sample
+# Library size = total number of reads per sample
+lib_size_df <- data.frame(
+  Sample = colnames(counts),              # Sample names from the counts matrix
+  LibrarySize = colSums(counts) / 1e6,    # Total reads divided by 1 million (easier to read)
+  Condition = metadata$condition           # COVID or Control group
+)
+
+# Calculate summary statistics
+# This gives me min, max, median, etc. for the library sizes
+lib_summary <- summary(lib_size_df$LibrarySize)
+```
+
+```{r lib-size-barplot, fig.cap="**Figure 1:** Library size distribution across all 484 samples. COVID-positive samples are shown in red and control samples in blue. Samples are ordered by library size."}
+# Create bar plot showing library size for each sample
+# This visualization helps identify samples with unusually low/high sequencing depth
+ggplot(lib_size_df, aes(x = reorder(Sample, LibrarySize),  # Reorder samples by library size (smallest to largest)
+                        y = LibrarySize,                    # Y-axis: library size in millions
+                        fill = Condition)) +                # Color bars by COVID status
+  
+  geom_bar(stat = "identity") +                            # Use actual values (not counts)
+  
+  scale_fill_manual(values = c("Control" = "blue",         # Assign colors manually:
+                               "COVID" = "red")) +          # Blue for controls, red for COVID
+  
+  labs(x = "Sample",                                       # Axis labels and title
+       y = "Library Size (millions)", 
+       title = "Library Size by Sample") +
+  
+  theme_minimal() +                                        # Clean, minimal theme
+  
+  theme(axis.text.x = element_blank(),                     # Remove x-axis text (too many samples)
+        axis.ticks.x = element_blank()) +                  # Remove x-axis tick marks
+  
+  coord_flip()                                             # Flip coordinates for horizontal bars
+                                                           # Makes it easier to see all 484 samples
+```
+
+Figure 1 and Table 1 show library sizes ranging from **`r round(lib_summary["Min."], 2)`** to **`r round(lib_summary["Max."], 2)`** million reads, with a median of **`r round(lib_summary["Median"], 2)`** million. Most samples had 1-3 million reads, which is typical for RNA-seq. The mean is higher than the median due to a few high-count outliers.
+
+**Table 1: Library Size Summary Statistics (in millions of reads)**
+```{r lib-size-table}
+lib_stats <- data.frame(
+  Statistic = c("Minimum", "1st Quartile", "Median", "Mean", "3rd Quartile", "Maximum"),
+  Value = round(as.numeric(lib_summary), 2)
+)
+knitr::kable(lib_stats, col.names = c("Statistic", "Library Size (millions)"))
+```
+
+```{r lib-size-boxplot, fig.cap="**Figure 2:** Comparison of library sizes between COVID-positive and control groups. Both groups show similar sequencing depth distributions."}
+ggplot(lib_size_df, aes(x = Condition, y = LibrarySize, fill = Condition)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Control" = "blue", "COVID" = "red")) +
+  labs(x = "Condition", y = "Library Size (millions)", title = "Library Size by Condition") +
+  theme_bw()
+```
+
+Figure 2 compares library sizes between groups. Both COVID and control samples show similar distributions with medians around 1.5-2 million reads, indicating no sequencing depth bias between conditions.
+
+## Count Distribution
+```{r calculate-logcpm}
+# Calculate log-CPM values
+logCPM_raw <- cpm(dge, log = TRUE)
+```
+
+```{r density-plot, fig.cap="**Figure 3:** Log-CPM density distribution across all samples. Each line represents one sample. Consistent distributions indicate good data quality."}
+plotDensities(logCPM_raw, legend = FALSE,
+              main = "Log-CPM Distribution Across Samples")
+```
+
+The density plot (Figure 3) shows consistent bimodal expression distributions across most samples, with one potential outlier showing a sharp peak. This sample was kept since it did not affect downstream results.
+
+## Sample Correlation
+```{r correlation-heatmap, fig.cap="**Figure 4:** Sample correlation heatmap for 50 randomly selected samples. Samples are annotated by condition (COVID vs Control) and clustered using Ward's method."}
+# ============================================================
+# SAMPLE CORRELATION HEATMAP
+# Purpose: Visualize pairwise correlations between samples
+# to assess overall data quality and identify outliers
+# ============================================================
+
+# Set random seed for reproducibility
+# This ensures the same 50 samples are selected each time the code runs
+set.seed(123)
+
+# Randomly select 50 samples for visualization
+# (Plotting all 484 samples would make the heatmap unreadable)
+sample_subset <- sample(colnames(logCPM_raw), 50)
+
+# Calculate Pearson correlation matrix between selected samples
+# High correlations (close to 1) indicate similar expression profiles
+# Low correlations may indicate outliers or batch effects
+cor_matrix <- cor(logCPM_raw[, sample_subset])
+
+# Create annotation data frame for the heatmap
+# This adds a color bar showing COVID vs Control status for each sample
+annotation_col <- data.frame(
+  Condition = metadata[sample_subset, "condition"],
+  row.names = sample_subset
+)
+
+# Generate the correlation heatmap using pheatmap
+pheatmap(cor_matrix, 
+         annotation_col = annotation_col,    # Add condition annotation bar
+         show_rownames = FALSE,              # Hide sample names (too crowded)
+         show_colnames = FALSE,              # Hide column names
+         clustering_method = "ward.D",       # Ward's method for hierarchical clustering
+                                             # Groups similar samples together
+         main = "Sample Correlation (50 random samples)")
+```
+
+The correlation heatmap (Figure 4)  was generated using pheatmap [@pheatmap2019] and  shows moderate to high correlations (0.6-0.9) between samples. Some control samples cluster together with lower correlation to COVID samples, suggesting real expression differences between groups.
+
+## Dimensionality Reduction
+```{r mds-plot, fig.cap="**Figure 5:** MDS plot showing sample relationships. COVID-positive samples (red) and control samples (blue) show partial separation along the first two dimensions."}
+plotMDS(dge, col = ifelse(dge$samples$group == "COVID", "red", "blue"),
+        main = "MDS Plot: COVID vs Control")
+legend("topright", legend = c("COVID", "Control"), col = c("red", "blue"), pch = 16)
+```
+
+The MDS plot (Figure 5) shows partial separation between COVID and control samples, with dimension 1 capturing 16% of variance and dimension 2 capturing 5%.
+```{r pca-calculation}
+# ============================================================
+# PRINCIPAL COMPONENT ANALYSIS (PCA)
+# Purpose: Reduce dimensionality to visualize sample relationships
+# and identify major sources of variation in the data
+# ============================================================
+
+# Perform PCA on the transposed log-CPM matrix
+# t() transposes so samples are rows (required by prcomp)
+# scale = TRUE standardizes genes to have mean=0 and SD=1
+# This prevents highly expressed genes from dominating the analysis
+pca_raw <- prcomp(t(logCPM_raw), scale = TRUE)
+
+# Extract variance explained by each principal component
+# importance contains: standard deviation, proportion of variance, cumulative proportion
+# We keep first 5 PCs for summary table
+pca_var <- data.frame(summary(pca_raw)$importance)[, 1:5]
+
+# Create a tidy data frame for ggplot visualization
+# Combines PCA coordinates with sample metadata
+pca_data <- data.frame(
+  PC1 = pca_raw$x[,1],              # First principal component scores
+  PC2 = pca_raw$x[,2],              # Second principal component scores
+  Condition = metadata$condition,    # COVID or Control status
+  Sample = rownames(pca_raw$x)       # Sample identifiers
+)
+```
+
+```{r pca-plot, fig.cap="**Figure 6:** PCA plot showing sample clustering before preprocessing. PC1 and PC2 capture the majority of variance, with partial separation between COVID-positive (red) and control (blue) samples."}
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_hline(yintercept = 0, colour = "gray65", linetype = "dashed") +
+  geom_vline(xintercept = 0, colour = "gray65", linetype = "dashed") +
+  scale_color_manual(values = c("Control" = "blue", "COVID" = "red")) +
+  scale_x_continuous(name = paste0("PC1 (", round(summary(pca_raw)$importance[2,1]*100, 1), "%)")) +
+  scale_y_continuous(name = paste0("PC2 (", round(summary(pca_raw)$importance[2,2]*100, 1), "%)")) +
+  ggtitle("PCA Plot: COVID vs Control (Before Preprocessing)") +
+  theme_bw() +
+  theme(legend.position = "right")
+```
+
+PCA (Figure 6) shows PC1 explaining 13.6% and PC2 explaining 11.1% of variance (Table 2). The first five components together explain about 31% of total variance, indicating multiple sources of variation, which is common for RNA-seq experiments. Partial separation between conditions suggests COVID infection causes detectable gene expression changes.
+
+**Table 2: Variance Explained by First 5 Principal Components**
+```{r pca-table}
+# Create summary table of variance explained by first 5 PCs
+var_explained <- summary(pca_raw)$importance[, 1:5]
+
+pca_table <- data.frame(
+  PC = paste0("PC", 1:5),
+  Std_Dev = round(var_explained[1, ], 4),
+  Variance_Pct = round(var_explained[2, ] * 100, 2),      # Convert proportion to percentage
+  Cumulative_Pct = round(var_explained[3, ] * 100, 2)
+)
+
+knitr::kable(pca_table, 
+             col.names = c("PC", "Std Dev", "% Variance", "Cumulative %"),
+             row.names = FALSE)
+```
+
+
+
+
+
+## Preprocessing
+
+Before running the differential expression analysis, the data needed to be cleaned up a bit. This involved two main steps: removing genes that are not really expressed, and normalizing the data to account for differences in sequencing depth.
+
+
+```{r filtering}
+# Store counts before filtering
+genes_before <- nrow(dge)
+
+# Apply filtering
+keep <- filterByExpr(dge, min.count = 10, min.total.count = 15)
+
+# Filter the DGEList
+dge <- dge[keep, , keep.lib.sizes = FALSE]
+
+# Calculate statistics
+genes_after <- nrow(dge)
+genes_removed <- genes_before - genes_after
+pct_removed <- round(genes_removed / genes_before * 100, 1)
+```
+
+Lowly expressed genes were filtered using `filterByExpr` with a minimum of 10 counts per gene. As shown in Table 3, filtering reduced the gene count from 35,784 to 11,284 (68.5% removed), which is typical for RNA-seq data from specific tissues.
+
+**Table 3: Gene Filtering Results**
+```{r filtering-table}
+# Create summary table showing filtering results
+# This documents how many genes were removed for low expression
+filter_stats <- data.frame(
+  Metric = c("Genes before filtering", 
+             "Genes after filtering", 
+             "Genes removed",
+             "Percentage removed"),
+  Value = c(format(genes_before, big.mark = ","),
+            format(genes_after, big.mark = ","),
+            format(genes_removed, big.mark = ","),
+            paste0(pct_removed, "%"))
+)
+
+# Display as formatted table
+# Removing ~68% of genes is typical for tissue-specific RNA-seq data
+knitr::kable(filter_stats, col.names = c("Metric", "Count"), row.names = FALSE)
+```
+
+```{r normalization}
+# Apply TMM normalization
+dge <- calcNormFactors(dge, method = "TMM")
+
+# Get normalization factor summary
+norm_summary <- summary(dge$samples$norm.factors)
+```
+
+TMM normalization was applied to adjust for RNA composition differences between samples. Table 4 shows normalization factors ranging from **`r round(norm_summary["Min."], 3)`** to **`r round(norm_summary["Max."], 3)`**, with a median of **`r round(norm_summary["Median"], 3)`**. Most factors are close to 1.0, indicating relatively consistent library compositions.
+
+**Table 4: Normalization Factor Summary**
+```{r norm-table}
+norm_stats <- data.frame(
+  Statistic = c("Minimum", "1st Quartile", "Median", "Mean", "3rd Quartile", "Maximum"),
+  Value = round(as.numeric(norm_summary), 4)
+)
+
+knitr::kable(norm_stats, col.names = c("Statistic", "Normalization Factor"), row.names = FALSE)
+```
+
+```{r calculate-logcpm-post}
+# Calculate log-CPM after preprocessing
+logCPM <- cpm(dge, log = TRUE)
+```
+
+```{r density-after, fig.cap="**Figure 7:** Log-CPM density distribution after filtering lowly expressed genes and TMM normalization. The distributions are more uniform compared to pre-filtering."}
+plotDensities(logCPM, legend = FALSE,
+              main = "Log-CPM Distribution After Filtering & Normalization")
+```
+
+Figure 7 shows more uniform log-CPM distributions after preprocessing compared to the raw data (Figure 3). The peak near zero is gone since lowly expressed genes were filtered out.
+
+
+# Batch Effect Correction
+
+Since no batch information was available, Surrogate Variable Analysis (SVA) was used to identify and correct for hidden sources of variation.
+
+
+```{r load-sva}
+library(sva)
+```
+
+Figure 8 shows samples colored by processing order. Colors are mixed throughout rather than clustering, suggesting processing order didn't introduce major batch effects.
+
+```{r mds-batch-check, fig.cap="**Figure 8:** MDS plot colored by sample processing order to assess potential batch effects. Colors represent sequential groups of samples."}
+# Check for potential batch effects based on sample processing order
+# If samples were processed in batches, sequential samples may cluster together
+sample_order <- 1:ncol(dge)
+
+# MDS plot colored by sample order (divided into 10 groups)
+# If colors cluster together, there may be batch effects related to processing order
+plotMDS(dge, col = rainbow(10)[cut(sample_order, 10)],
+        main = "MDS Plot: Colored by Sample Order")
+```
+
+## Surrogate Variable Analysis (SVA)
+
+SVA identifies hidden sources of variation (surrogate variables) that are not captured by the primary variable of interest (COVID status).
+```{r sva-analysis}
+# Model matrices for SVA
+mod <- model.matrix(~ condition, data = metadata)
+mod0 <- model.matrix(~ 1, data = metadata)
+
+# Apply SVA with 4 surrogate variables
+n_sv <- 4
+svobj <- sva(logCPM, mod, mod0, n.sv = n_sv)
+```
+
+SVA identified **`r svobj$n.sv` surrogate variables** representing hidden sources of variation in the data.
+
+## PCA Before Batch Correction
+```{r pca-before}
+# PCA before batch correction (for comparison with post-correction)
+pca_before <- prcomp(t(logCPM), scale = TRUE)
+
+# Create data frame for plotting
+pca_data_before <- data.frame(
+  PC1 = pca_before$x[,1],
+  PC2 = pca_before$x[,2],
+  Condition = metadata$condition,
+  Sample = rownames(pca_before$x)
+)
+
+# Store variance explained for comparison with post-correction PCA
+var_before <- summary(pca_before)$importance[, 1:5]
+```
+
+Figure 9 shows PCA before batch correction. PC1 explains 17.2% and PC2 explains 4.7% of variance. There's some separation between COVID and control samples, but groups still overlap, possibly due to hidden batch effects.
+
+```{r pca-before-plot, fig.cap="**Figure 9:** PCA plot before batch correction. Samples show mixed clustering between COVID-positive (red) and control (blue) groups."}
+ggplot(pca_data_before, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_hline(yintercept = 0, colour = "gray65", linetype = "dashed") +
+  geom_vline(xintercept = 0, colour = "gray65", linetype = "dashed") +
+  scale_color_manual(values = c("Control" = "blue", "COVID" = "red")) +
+  labs(
+    x = paste0("PC1 (", round(var_before[2,1]*100, 1), "%)"),
+    y = paste0("PC2 (", round(var_before[2,2]*100, 1), "%)"),
+    title = "PCA BEFORE Batch Correction"
+  ) +
+  theme_bw()
+```
+
+Table 5 shows variance captured before batch correction, with PC1 explaining 17% and the first five PCs explaining 32% of total variance..
+
+**Table 5: Variance Explained Before Batch Correction**
+```{r pca-before-table}
+pca_table_before <- data.frame(
+  PC = paste0("PC", 1:5),
+  Std_Dev = round(var_before[1, ], 4),
+  Variance_Pct = round(var_before[2, ] * 100, 2),
+  Cumulative_Pct = round(var_before[3, ] * 100, 2)
+)
+
+knitr::kable(pca_table_before, 
+             col.names = c("PC", "Std Dev", "% Variance", "Cumulative %"),
+             row.names = FALSE)
+```
+
+## Apply Batch Correction
+```{r apply-correction}
+# Remove batch effects using SVA surrogate variables
+logCPM_corrected <- removeBatchEffect(logCPM, covariates = svobj$sv)
+```
+
+## PCA After Batch Correction
+```{r pca-after}
+# PCA after SVA batch correction (to compare with pre-correction)
+pca_after <- prcomp(t(logCPM_corrected), scale = TRUE)
+
+pca_data_after <- data.frame(
+  PC1 = pca_after$x[,1],
+  PC2 = pca_after$x[,2],
+  Condition = metadata$condition,
+  Sample = rownames(pca_after$x)
+)
+
+# Store variance - expect PC1 variance to decrease if batch effects were removed
+var_after <- summary(pca_after)$importance[, 1:5]
+```
+
+Figure 10 shows PCA after SVA batch correction. PC1 variance dropped from 17.2% to 4.6%, indicating SVA successfully removed unwanted variation. Separation between COVID and control samples is now clearer.
+
+```{r pca-after-plot, fig.cap="**Figure 10:** PCA plot after SVA batch correction. Samples show improved separation between COVID-positive (red) and control (blue) groups."}
+ggplot(pca_data_after, aes(x = PC1, y = PC2, color = Condition)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_hline(yintercept = 0, colour = "gray65", linetype = "dashed") +
+  geom_vline(xintercept = 0, colour = "gray65", linetype = "dashed") +
+  scale_color_manual(values = c("Control" = "blue", "COVID" = "red")) +
+  labs(
+    x = paste0("PC1 (", round(var_after[2,1]*100, 1), "%)"),
+    y = paste0("PC2 (", round(var_after[2,2]*100, 1), "%)"),
+    title = "PCA AFTER Batch Correction (SVA)"
+  ) +
+  theme_bw()
+```
+
+**Table 6: Variance Explained After Batch Correction**
+```{r pca-after-table}
+pca_table_after <- data.frame(
+  PC = paste0("PC", 1:5),
+  Std_Dev = round(var_after[1, ], 4),
+  Variance_Pct = round(var_after[2, ] * 100, 2),
+  Cumulative_Pct = round(var_after[3, ] * 100, 2)
+)
+
+knitr::kable(pca_table_after, 
+             col.names = c("PC", "Std Dev", "% Variance", "Cumulative %"),
+             row.names = FALSE)
+```
+
+After batch correction, PC1 explains `r round(var_after[2,1]*100, 1)`% of variance (compared to `r round(var_before[2,1]*100, 1)`% before), indicating that the correction removed unwanted technical variation while preserving biological signal.
+
+## Hierarchical Clustering Comparison
+
+Hierarchical clustering was performed on the top 10% most variable genes before and after batch correction to visualize the effect of SVA correction on sample grouping.
+```{r clustering-setup}
+# Select top 10% most variable genes
+gene_var <- apply(logCPM, 1, var)
+top10pct <- names(sort(gene_var, decreasing = TRUE))[1:round(nrow(logCPM)*0.1)]
+n_top_genes <- length(top10pct)
+
+# Prepare data matrices
+data_before <- logCPM[top10pct, ]
+data_after <- logCPM_corrected[top10pct, ]
+
+# Annotation for heatmaps
+annotation_col <- data.frame(
+  Condition = metadata$condition,
+  row.names = rownames(metadata)
+)
+```
+
+Figure 11 shows hierarchical clustering of the top 10% most variable genes (**`r format(n_top_genes, big.mark = ",")`** genes) before batch correction. Control samples (blue) are scattered throughout rather than grouping together, suggesting other sources of variation were driving clustering patterns.
+
+```{r clustering-before, fig.cap="**Figure 11:** Hierarchical clustering of top 10% most variable genes BEFORE batch correction. Samples are annotated by condition."}
+pheatmap(data_before,
+         scale = "row",
+         annotation_col = annotation_col,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         clustering_method = "ward.D",
+         main = "Hierarchical Clustering BEFORE Correction (Top 10% Variable Genes)")
+```
+Figure 12 shows the same heatmap after SVA correction. Control samples now cluster together more clearly, confirming that batch correction reduced technical noise and improved separation by condition.
+
+```{r clustering-after, fig.cap="**Figure 12:** Hierarchical clustering of top 10% most variable genes AFTER batch correction. Improved separation between COVID and Control samples is observed."}
+pheatmap(data_after,
+         scale = "row",
+         annotation_col = annotation_col,
+         show_rownames = FALSE,
+         show_colnames = FALSE,
+         clustering_method = "ward.D",
+         main = "Hierarchical Clustering AFTER Correction (Top 10% Variable Genes)")
+```
+
+## Differential Expression Model with SVA Covariates
+
+The surrogate variables were incorporated into the differential expression model to account for hidden batch effects.
+```{r de-with-sva}
+# Design matrix with SVA covariates
+design_sv <- model.matrix(~ 0 + condition + svobj$sv, data = metadata)
+colnames(design_sv) <- c("Control", "COVID", "SV1", "SV2", "SV3", "SV4")
+
+# Estimate dispersion
+dge_sv <- estimateDisp(dge, design_sv, robust = TRUE)
+
+# Fit model
+fit_sv <- glmQLFit(dge_sv, design_sv, robust = TRUE)
+
+# Test contrast
+contrast_sv <- makeContrasts(COVID - Control, levels = design_sv)
+qlf_sv <- glmQLFTest(fit_sv, contrast = contrast_sv)
+
+# Get results
+results_sv <- topTags(qlf_sv, n = Inf)$table
+de_genes_sva <- sum(results_sv$FDR < 0.05)
+```
+
+After incorporating SVA covariates, **`r format(de_genes_sva, big.mark = ",")`** genes were identified as differentially expressed (FDR < 0.05).
+
+
+
+# Differential Expression Analysis
+
+Differential expression analysis was performed using edgeR's quasi-likelihood framework, with SVA surrogate variables included as covariates in the model.
+```{r de-design}
+# Design matrix with SVA covariates (already created in Step 3, shown here for clarity)
+design_sv <- model.matrix(~ 0 + condition + svobj$sv, data = metadata)
+colnames(design_sv) <- c("Control", "COVID", "SV1", "SV2", "SV3", "SV4")
+```
+
+## Dispersion Estimation
+
+Dispersion estimates quantify the biological variability between samples for each gene.
+```{r estimate-dispersion}
+# Estimate gene-wise dispersion (biological variability) for the negative binomial model
+# robust = TRUE downweights outlier genes, improving accuracy for most genes
+dge_sv <- estimateDisp(dge, design_sv, robust = TRUE)
+```
+Figure 13 displays the biological coefficient of variation (BCV) for each gene. As expected, lowly expressed genes show higher variability than highly expressed genes. The common BCV is around 1.0, which is typical for human RNA-seq data.
+
+```{r bcv-plot, fig.cap="**Figure 13:** Biological coefficient of variation (BCV) plot showing the relationship between average gene expression (log-CPM) and variability. The common, trended, and gene-wise dispersions are shown."}
+plotBCV(dge_sv, main = "BCV Plot")
+```
+
+## Quasi-Likelihood Model Fitting
+```{r fit-model}
+# Fit quasi-likelihood negative binomial GLM
+# QL approach provides more robust error rate control than standard likelihood ratio test
+fit_sv <- glmQLFit(dge_sv, design_sv, robust = TRUE)
+```
+
+Figure 14 shows the quasi-likelihood dispersion estimates. The squeezed estimates (red) cluster tightly around the trend line, indicating that empirical Bayes moderation is working well for reliable statistical testing.
+
+```{r ql-plot, fig.cap="**Figure 14:** Quasi-likelihood dispersion plot showing raw (points) and squeezed (line) dispersion estimates across genes."}
+plotQLDisp(fit_sv, main = "QL Dispersion Plot")
+```
+
+## Differential Expression Testing
+```{r de-test}
+# Define contrast: COVID vs Control
+contrast_sv <- makeContrasts(COVID - Control, levels = design_sv)
+
+# Perform quasi-likelihood F-test
+qlf_sv <- glmQLFTest(fit_sv, contrast = contrast_sv)
+
+# Extract all results
+results_sv <- topTags(qlf_sv, n = Inf)$table
+
+# Calculate summary statistics
+total_genes <- nrow(results_sv)
+de_fdr05 <- sum(results_sv$FDR < 0.05)
+de_fdr05_lfc1 <- sum(results_sv$FDR < 0.05 & abs(results_sv$logFC) > 1)
+de_fdr01_lfc1 <- sum(results_sv$FDR < 0.01 & abs(results_sv$logFC) > 1)
+```
+
+## Filtering Criteria and Multiple Testing Correction
+
+Multiple testing correction was performed using the Benjamini-Hochberg method to control the false discovery rate (FDR).
+
+Table 7 summarizes differential expression results at different thresholds. Out of 11,284 genes tested, 6,104 (54%) were significant at FDR < 0.05. With a fold change cutoff (|logFC| > 1), this dropped to 2,140 genes.
+
+**Table 7: Differential Expression Summary**
+```{r de-summary-table}
+# Summary table showing DE genes at different significance thresholds
+# FDR < 0.05 alone may include small effect sizes; adding |logFC| > 1 focuses on biologically meaningful changes
+de_summary <- data.frame(
+  Criterion = c("Total genes tested",
+                "DE genes (FDR < 0.05)",
+                "DE genes (FDR < 0.05 & |logFC| > 1)",
+                "DE genes (FDR < 0.01 & |logFC| > 1)"),
+  Count = c(format(total_genes, big.mark = ","),
+            format(de_fdr05, big.mark = ","),
+            format(de_fdr05_lfc1, big.mark = ","),
+            format(de_fdr01_lfc1, big.mark = ","))
+)
+
+knitr::kable(de_summary, col.names = c("Filtering Criterion", "Number of Genes"), row.names = FALSE)
+```
+
+```{r add-significance}
+# Classify genes by significance and direction of change
+# Using dual threshold: FDR < 0.05 AND |logFC| > 1 (2-fold change)
+results_sv$significance <- "Not Significant"
+results_sv$significance[results_sv$FDR < 0.05 & results_sv$logFC > 1] <- "Upregulated"
+results_sv$significance[results_sv$FDR < 0.05 & results_sv$logFC < -1] <- "Downregulated"
+
+# Count genes in each category for reporting
+sig_counts <- table(results_sv$significance)
+up_count <- sig_counts["Upregulated"]
+down_count <- sig_counts["Downregulated"]
+ns_count <- sig_counts["Not Significant"]
+```
+Table 8 breaks down the DE genes by direction. There were more downregulated genes (1,506) than upregulated ones (634) in COVID patients, suggesting the virus may suppress more cellular processes than it activates.
+
+**Table 8: Gene Classification by Expression Change**
+```{r sig-table}
+# Display table of gene counts by expression change category
+sig_summary <- data.frame(
+  Category = c("Upregulated (logFC > 1, FDR < 0.05)",
+               "Downregulated (logFC < -1, FDR < 0.05)",
+               "Not Significant"),
+  Count = c(format(up_count, big.mark = ","),
+            format(down_count, big.mark = ","),
+            format(ns_count, big.mark = ","))
+)
+
+knitr::kable(sig_summary, col.names = c("Category", "Number of Genes"), row.names = FALSE)
+```
+
+## Top Differentially Expressed Genes
+
+Table 9 lists the top 20 DE genes ranked by FDR. Notably, all of them have negative fold changes, meaning they're downregulated in COVID patients. Several ribosomal protein genes (RPS21, RPL13A, RPLP1, RPL13, RPS8) appear in this list, which is consistent with the original Lieberman et al. findings.
+
+**Table 9: Top 20 Differentially Expressed Genes**
+```{r top20-table}
+# Extract top 20 most significant DE genes (already sorted by FDR from topTags)
+top20 <- head(results_sv, 20)
+
+# Format for publication-quality table
+top20_display <- data.frame(
+  Gene = rownames(top20),
+  logFC = round(top20$logFC, 3),
+  logCPM = round(top20$logCPM, 3),                         # Average expression level
+  F = round(top20$F, 2),                                   # Quasi-likelihood F-statistic
+  PValue = formatC(top20$PValue, format = "e", digits = 2), 
+  FDR = formatC(top20$FDR, format = "e", digits = 2)
+)
+
+knitr::kable(top20_display, row.names = FALSE,
+             caption = "Top 20 differentially expressed genes ranked by FDR")
+```
+
+## Volcano Plot
+```{r volcano-setup}
+# Add gene names for labeling
+results_sv$gene <- rownames(results_sv)
+
+# Select top 10 up and down genes to label
+top_up <- results_sv[results_sv$significance == "Upregulated", ]
+top_up <- top_up[order(top_up$FDR), ][1:10, ]
+
+top_down <- results_sv[results_sv$significance == "Downregulated", ]
+top_down <- top_down[order(top_down$FDR), ][1:10, ]
+
+genes_to_label <- c(rownames(top_up), rownames(top_down))
+results_sv$label <- ifelse(rownames(results_sv) %in% genes_to_label, rownames(results_sv), "")
+```
+
+Figure 15 shows the volcano plot of all tested genes. Downregulated genes tend to have higher significance, with IGFBP2 being most significant overall. Among upregulated genes, interferon-stimulated genes (OAS2, OAS3, IFI44L, IFIT1) stand out, matching the expected antiviral response.
+
+```{r volcano-plot, fig.height=8, fig.cap="**Figure 15:** Volcano plot showing differential expression results. Red points indicate significantly upregulated genes (logFC > 1, FDR < 0.05), blue points indicate significantly downregulated genes (logFC < -1, FDR < 0.05). The top 10 genes in each direction are labeled."}
+# Volcano plot: visualizes both significance (y-axis) and effect size (x-axis)
+ggplot(results_sv, aes(x = logFC, y = -log10(PValue), color = significance)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  
+  # Label top genes (defined earlier in genes_to_label)
+  geom_text_repel(
+    aes(label = label),
+    size = 3,
+    max.overlaps = 20,
+    box.padding = 0.5
+  ) +
+  
+  scale_color_manual(values = c(
+    "Upregulated" = "red",
+    "Downregulated" = "blue",
+    "Not Significant" = "gray60"
+  )) +
+  
+  # Dashed lines show significance thresholds: |logFC| > 1 and p < 0.05
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray40") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray40") +
+  
+  labs(
+    x = "log2 Fold Change",
+    y = "-log10(P-value)",
+    title = "Volcano Plot: COVID vs Control (SVA Corrected)",
+    color = "Significance"
+  ) +
+  theme_bw() +
+  theme(legend.position = "right")
+```
+
+## Expression of Top 10 DE Genes
+```{r boxplot-setup}
+library(tidyr)
+
+# Get top 10 most significant DE genes
+top10_genes <- rownames(results_sv)[1:10]
+
+# Prepare expression data for plotting
+top10_data <- data.frame(t(logCPM[top10_genes, ]))
+top10_data$Condition <- metadata$condition
+top10_data$Sample <- rownames(top10_data)
+
+# Convert from wide to long format for ggplot faceting
+top10_long <- pivot_longer(
+  top10_data, 
+  cols = all_of(top10_genes),
+  names_to = "Gene",
+  values_to = "Expression"
+)
+
+# Preserve gene order by significance (most significant first)
+top10_long$Gene <- factor(top10_long$Gene, levels = top10_genes)
+```
+Figure 16 shows clear expression differences between COVID and control samples for all top 10 genes. All of these genes show lower expression in COVID patients, with large fold changes visible between the groups. The consistent pattern across these genes supports the reliability of the differential expression results.
+
+```{r boxplot-top10, fig.height=8, fig.cap="**Figure 16:** Boxplots showing expression levels (log2 CPM) of the top 10 differentially expressed genes between COVID-positive (red) and control (blue) samples."}
+# Boxplots showing expression of top 10 DE genes in COVID vs Control
+# Each facet is a separate gene with its own y-axis scale
+ggplot(top10_long, aes(x = Condition, y = Expression, fill = Condition)) +
+  geom_boxplot(outlier.size = 0.5) +
+  facet_wrap(~ Gene, scales = "free_y", ncol = 5) +
+  scale_fill_manual(values = c("Control" = "blue", "COVID" = "red")) +
+  labs(
+    title = "Top 10 Differentially Expressed Genes",
+    x = "Condition",
+    y = "log2 CPM"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",                             
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_rect(fill = "white")
+  )
+```
+
+## Heatmap of Top 50 DE Genes
+Figure 17 displays expression patterns for the top 50 DE genes. Control samples (blue bar) cluster together on the left and show higher expression (orange/red) for most genes, while COVID samples show lower expression (yellow/blue). Many ribosomal protein genes (RPS, RPL) are visible, confirming the downregulation of translation machinery in COVID patients.
+```{r heatmap-top50, fig.height=10, fig.cap="**Figure 17:** Heatmap of the top 50 differentially expressed genes. Rows are scaled (z-score) and clustered using complete linkage. Samples are annotated by condition."}
+top50_genes <- rownames(results_sv)[1:50]
+heatmap_data <- logCPM[top50_genes, ]
+
+annotation_col <- data.frame(
+  Condition = metadata$condition,
+  row.names = rownames(metadata)
+)
+
+pheatmap(heatmap_data,
+         scale = "row",
+         annotation_col = annotation_col,
+         show_colnames = FALSE,
+         clustering_method = "complete",
+         main = "Top 50 DE Genes: COVID vs Control")
+```
+
+## Comparison with Original Publication
+
+Lieberman et al. (2020) reported two major transcriptional signatures in COVID-19 patients:
+
+1. **Strong interferon-driven antiviral response** (upregulated genes)
+2. **Reduced transcription of ribosomal proteins** (downregulated genes)
+```{r publication-comparison}
+# Check for interferon-related genes in upregulated set
+up_genes <- rownames(results_sv)[results_sv$significance == "Upregulated"]
+ifn_genes <- up_genes[grep("^IFI|^OAS|^MX|^ISG|^IRF", up_genes)]
+
+# Check for ribosomal proteins in downregulated set
+down_genes <- rownames(results_sv)[results_sv$significance == "Downregulated"]
+ribo_genes <- down_genes[grep("^RPS|^RPL", down_genes)]
+```
+
+### Interferon-Related Genes
+
+We identified **`r length(ifn_genes)`** interferon-related genes among the significantly upregulated genes:
+```{r ifn-list}
+# Print list of interferon-related genes found among upregulated genes
+# These genes (IFI*, OAS*, MX*, ISG*, IRF*) indicate antiviral response activation
+if(length(ifn_genes) > 0) {
+  cat(paste(ifn_genes, collapse = ", "))
+}
+```
+
+### Ribosomal Protein Genes
+
+We identified **`r length(ribo_genes)`** ribosomal protein genes among the significantly downregulated genes:
+```{r ribo-list}
+# Print ribosomal protein genes found among downregulated genes (first 25)
+# Downregulation of RPS*/RPL* genes suggests viral disruption of host translation machinery
+if(length(ribo_genes) > 0) {
+  cat(paste(head(ribo_genes, 25), collapse = ", "))
+}
+```
+
+Our findings are **consistent with the original publication**, confirming both the interferon-driven antiviral response and the downregulation of ribosomal machinery in COVID-19 patients.
+
+## Export Results
+```{r export-de, eval=FALSE, echo=TRUE}
+write.csv(results_sv, 
+          file = "DE_results_COVID_vs_Control.csv",
+          row.names = TRUE)
+```
+
+
+
+
+# Functional Enrichment Analysis
+
+Functional enrichment analysis identifies biological processes, molecular functions, cellular components, and pathways that are overrepresented among differentially expressed genes. Both overrepresentation analysis (ORA) and Gene Set Enrichment Analysis (GSEA) were performed.
+
+```{r load-enrichment-packages}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(DOSE)
+```
+
+Part A: Overrepresentation Analysis (ORA)
+
+ORA tests whether specific gene sets are overrepresented among differentially expressed genes compared to a background set.
+
+## Prepare Gene Lists
+```{r prepare-gene-lists}
+# Significant DE genes (FDR < 0.05 and |logFC| > 1)
+sig_genes <- rownames(results_sv)[results_sv$FDR < 0.05 & abs(results_sv$logFC) > 1]
+
+# Separate by direction
+up_genes_list <- rownames(results_sv)[results_sv$FDR < 0.05 & results_sv$logFC > 1]
+down_genes_list <- rownames(results_sv)[results_sv$FDR < 0.05 & results_sv$logFC < -1]
+
+# Store counts
+n_sig <- length(sig_genes)
+n_up <- length(up_genes_list)
+n_down <- length(down_genes_list)
+```
+
+Table 10 shows the gene lists used for functional enrichment analysis. These 2,140 genes that passed both FDR and fold change thresholds were used as input for ORA and GSEA.
+
+**Table 10: Gene Lists for Enrichment Analysis**
+```{r gene-list-table}
+gene_list_summary <- data.frame(
+  Category = c("Total significant DE genes",
+               "Upregulated genes",
+               "Downregulated genes"),
+  Count = c(format(n_sig, big.mark = ","),
+            format(n_up, big.mark = ","),
+            format(n_down, big.mark = ","))
+)
+
+knitr::kable(gene_list_summary, col.names = c("Gene Set", "Number of Genes"), row.names = FALSE)
+```
+
+## Convert Gene Symbols to Entrez IDs
+```{r convert-to-entrez}
+# Convert significant genes
+sig_entrez <- bitr(sig_genes, 
+                   fromType = "SYMBOL", 
+                   toType = "ENTREZID", 
+                   OrgDb = org.Hs.eg.db)
+
+# Convert upregulated genes
+up_entrez <- bitr(up_genes_list, 
+                  fromType = "SYMBOL", 
+                  toType = "ENTREZID", 
+                  OrgDb = org.Hs.eg.db)
+
+# Convert downregulated genes
+down_entrez <- bitr(down_genes_list, 
+                    fromType = "SYMBOL", 
+                    toType = "ENTREZID", 
+                    OrgDb = org.Hs.eg.db)
+
+# Background: all tested genes
+all_genes <- rownames(results_sv)
+all_entrez <- bitr(all_genes, 
+                   fromType = "SYMBOL", 
+                   toType = "ENTREZID", 
+                   OrgDb = org.Hs.eg.db)
+
+# Store mapping statistics
+n_mapped_sig <- nrow(sig_entrez)
+n_mapped_bg <- nrow(all_entrez)
+```
+
+Successfully mapped **`r format(n_mapped_sig, big.mark = ",")`** significant genes and **`r format(n_mapped_bg, big.mark = ",")`** background genes to Entrez IDs.
+
+## GO Enrichment Analysis
+
+### GO Biological Process (BP)
+```{r go-bp-ora}
+# GO Biological Process overrepresentation analysis
+# Tests if DE genes are enriched for specific biological processes compared to background
+ego_BP <- enrichGO(gene = sig_entrez$ENTREZID,
+                   universe = all_entrez$ENTREZID,     # Background: all expressed genes
+                   OrgDb = org.Hs.eg.db,               # Human annotation database
+                   ont = "BP",                          # Biological Process ontology
+                   pAdjustMethod = "BH",                # Benjamini-Hochberg FDR correction
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05,
+                   readable = TRUE)                     # Convert Entrez IDs to gene symbols
+
+n_bp_ora <- nrow(ego_BP)
+```
+
+Figures 18-19 show top enriched GO Biological Process terms, with cytoplasmic translation (~85 genes) and defense response to virus (~80 genes) being most enriched, aligning with our DE findings.
+```{r go-bp-dotplot, fig.cap="**Figure 18:** Top 15 enriched GO Biological Process terms from overrepresentation analysis. Point size indicates gene count; color indicates adjusted p-value."}
+dotplot(ego_BP, showCategory = 15, title = "GO Biological Process")
+```
+
+
+
+```{r go-bp-barplot, fig.cap="**Figure 19:** Bar plot of top 15 enriched GO Biological Process terms."}
+barplot(ego_BP, showCategory = 15, title = "GO Biological Process")
+```
+
+### GO Molecular Function (MF)
+```{r go-mf-ora}
+# GO Molecular Function overrepresentation analysis
+ego_MF <- enrichGO(gene = sig_entrez$ENTREZID,
+                   universe = all_entrez$ENTREZID,
+                   OrgDb = org.Hs.eg.db,
+                   ont = "MF",                          # Molecular Function ontology
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05,
+                   readable = TRUE)
+
+n_mf_ora <- nrow(ego_MF)
+```
+Figures 20-21 show enriched GO Molecular Function and Cellular Component terms. Ribosome-related terms dominate, supporting the finding that translation-related functions are disrupted in COVID patients.
+
+```{r go-mf-dotplot, fig.cap="**Figure 20:** Top 15 enriched GO Molecular Function terms from overrepresentation analysis."}
+dotplot(ego_MF, showCategory = 15, title = "GO Molecular Function")
+```
+
+### GO Cellular Component (CC)
+```{r go-cc-ora}
+# Run ORA on GO Cellular Component terms
+# CC tells us which parts of the cell are affected by COVID
+ego_CC <- enrichGO(gene = sig_entrez$ENTREZID,
+                   universe = all_entrez$ENTREZID,
+                   OrgDb = org.Hs.eg.db,
+                   ont = "CC",                  # Cellular Component
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.05,
+                   qvalueCutoff = 0.05,
+                   readable = TRUE)             # convert IDs to gene names
+
+# Count how many CC terms were enriched
+n_cc_ora <- nrow(ego_CC)
+```
+
+
+
+```{r go-cc-dotplot, fig.cap="**Figure 21:** Top 15 enriched GO Cellular Component terms from overrepresentation analysis."}
+dotplot(ego_CC, showCategory = 15, title = "GO Cellular Component")
+```
+
+### GO Network Visualizations
+
+Figure 22 shows relationships between GO terms based on shared genes, revealing three main clusters: mitochondrial/energy metabolism, immune/antiviral response, and cilium-related processes.
+
+```{r go-emap, fig.height=8, fig.cap="**Figure 22:** Enrichment map showing relationships between enriched GO Biological Process terms. Connected terms share common genes."}
+# Calculate pairwise similarity between enriched GO terms based on shared genes
+ego_BP_sim <- pairwise_termsim(ego_BP)
+
+# Enrichment map: network showing relationships between GO terms
+# Connected terms share common genes; clusters reveal related biological themes
+emapplot(ego_BP_sim, showCategory = 20)
+```
+
+Figure 23 shows genes in top enriched pathways, with ribosomal proteins (RPL, RPS) in the cytoplasmic translation cluster and mitochondrial genes in the oxidative phosphorylation cluster.
+
+```{r go-cnet, fig.height=8, fig.cap="**Figure 23:** Gene-concept network showing the relationship between top 5 GO BP terms and their associated genes."}
+cnetplot(ego_BP, showCategory = 5)
+```
+
+## KEGG Pathway Enrichment (ORA)
+```{r kegg-ora}
+# Run ORA on KEGG pathways using significant DE genes
+# KEGG pathways are curated metabolic and signaling pathways
+kegg_ora <- enrichKEGG(gene = sig_entrez$ENTREZID,       # our DE genes
+                       universe = all_entrez$ENTREZID,   # background (all expressed genes)
+                       organism = "hsa",                 # human
+                       pAdjustMethod = "BH",
+                       pvalueCutoff = 0.05,
+                       qvalueCutoff = 0.05)
+
+# Count how many KEGG pathways were enriched
+n_kegg_ora <- nrow(kegg_ora)
+```
+Figure 24 shows enriched KEGG pathways. The Coronavirus disease - COVID-19 pathway is the most enriched, which validates our analysis. Ribosome and oxidative phosphorylation pathways also appear, consistent with the GO results. Several neurodegenerative disease pathways (Huntington, Parkinson, Prion) are enriched due to shared mitochondrial dysfunction genes.
+
+```{r kegg-dotplot, fig.cap="**Figure 24:** Top 15 enriched KEGG pathways from overrepresentation analysis."}
+dotplot(kegg_ora, showCategory = 15, title = "KEGG Pathway Enrichment")
+```
+
+```{r kegg-barplot, fig.cap="**Figure 25:** Bar plot of top 15 enriched KEGG pathways."}
+barplot(kegg_ora, showCategory = 15, title = "KEGG Pathway Enrichment")
+```
+
+## Directional GO Enrichment (Up vs Down)
+
+Separate enrichment analyses for upregulated and downregulated genes reveal the biological processes associated with each direction of change.
+```{r go-up-down}
+# GO BP - Upregulated genes
+ego_BP_up <- enrichGO(gene = up_entrez$ENTREZID,
+                      universe = all_entrez$ENTREZID,
+                      OrgDb = org.Hs.eg.db,
+                      ont = "BP",
+                      pAdjustMethod = "BH",
+                      pvalueCutoff = 0.05,
+                      readable = TRUE)
+
+# GO BP - Downregulated genes
+ego_BP_down <- enrichGO(gene = down_entrez$ENTREZID,
+                        universe = all_entrez$ENTREZID,
+                        OrgDb = org.Hs.eg.db,
+                        ont = "BP",
+                        pAdjustMethod = "BH",
+                        pvalueCutoff = 0.05,
+                        readable = TRUE)
+```
+Figure 26 shows GO terms enriched among upregulated genes, with almost all top terms related to antiviral and immune responses, confirming upregulated genes drive the host immune response.
+
+```{r go-up-plot, fig.cap="**Figure 26:** Top 15 GO Biological Process terms enriched among upregulated genes in COVID-19 patients."}
+# Dotplot of GO Biological Process terms enriched in upregulated genes
+# These are the pathways that get turned ON during COVID infection
+dotplot(ego_BP_up, showCategory = 15, title = "GO BP - Upregulated in COVID")
+```
+
+Figure 27 shows GO terms enriched among downregulated genes. Cytoplasmic translation is by far the most enriched, along with cilium movement, aerobic respiration, and oxidative phosphorylation. 
+
+```{r go-down-plot, fig.cap="**Figure 27:** Top 15 GO Biological Process terms enriched among downregulated genes in COVID-19 patients."}
+# Dotplot of GO Biological Process terms enriched in downregulated genes
+# These are the pathways that get turned OFF during COVID infection
+dotplot(ego_BP_down, showCategory = 15, title = "GO BP - Downregulated in COVID")
+```
+
+Part B: Gene Set Enrichment Analysis (GSEA)
+
+GSEA uses the entire ranked gene list rather than a significance threshold, providing a more comprehensive view of pathway changes.
+
+## Prepare Ranked Gene List
+```{r gsea-prep}
+# Create ranked list using logFC
+gene_list <- results_sv$logFC
+names(gene_list) <- rownames(results_sv)
+
+# Convert to Entrez IDs
+symbol_to_entrez <- bitr(names(gene_list), 
+                         fromType = "SYMBOL", 
+                         toType = "ENTREZID", 
+                         OrgDb = org.Hs.eg.db)
+
+# Match and create named vector
+matched_idx <- match(symbol_to_entrez$SYMBOL, names(gene_list))
+gene_list_entrez <- gene_list[matched_idx]
+names(gene_list_entrez) <- symbol_to_entrez$ENTREZID
+
+# Remove NAs and sort in decreasing order
+gene_list_entrez <- gene_list_entrez[!is.na(gene_list_entrez)]
+gene_list_entrez <- sort(gene_list_entrez, decreasing = TRUE)
+
+n_ranked <- length(gene_list_entrez)
+```
+
+The ranked gene list contains **`r format(n_ranked, big.mark = ",")`** genes ordered by log2 fold change.
+
+## GSEA - GO Analysis
+
+### GO Biological Process
+```{r gsea-bp}
+# Gene Set Enrichment Analysis for GO Biological Process
+# Unlike ORA, GSEA uses ALL genes ranked by fold change (no cutoff)
+# Tests whether genes in a pathway tend to be at the top or bottom of the ranked list
+gsea_BP <- gseGO(geneList = gene_list_entrez,
+                 OrgDb = org.Hs.eg.db,
+                 ont = "BP",
+                 minGSSize = 10,                # Minimum genes per pathway
+                 maxGSSize = 500,               # Maximum genes per pathway
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod = "BH",
+                 verbose = FALSE)
+
+n_gsea_bp <- nrow(gsea_BP)
+```
+
+
+Figure 28 shows GSEA results split by direction: activated pathways include immune and antiviral processes, while suppressed pathways are dominated by cilium movement, translation, and mitochondrial respiration.
+
+```{r gsea-bp-dotplot, fig.height=8, fig.cap="**Figure 28:** GSEA results for GO Biological Process, split by direction of enrichment (activated vs suppressed pathways)."}
+# Dotplot of GSEA results for Biological Process terms
+# Split by .sign separates activated vs suppressed pathways
+if(nrow(gsea_BP) > 0) {
+  dotplot(gsea_BP, showCategory = 15, title = "GSEA: GO Biological Process", split = ".sign") +
+    facet_grid(.~.sign)
+}
+```
+
+Figure 29 displays fold change distributions for each pathway, with immune-related pathways shifted right (upregulated) and translation/metabolic pathways shifted left (downregulated).
+
+```{r gsea-bp-ridge, fig.height=8, fig.cap="**Figure 29:** Ridge plot showing the distribution of fold changes for genes in each enriched GO BP term."}
+if(nrow(gsea_BP) > 0) {
+  ridgeplot(gsea_BP, showCategory = 15) + 
+    ggtitle("GSEA: GO Biological Process - Ridge Plot")
+}
+```
+
+Figure 30 shows classic GSEA enrichment plots. Defense response to virus (green) and response to virus (blue) peak early in the ranked list, indicating genes in these pathways are upregulated. Cytoplasmic translation (red) shows the opposite pattern, with genes concentrated at the bottom of the ranked list.
+
+```{r gsea-bp-plot, fig.cap="**Figure 30:** GSEA enrichment plots for the top 3 enriched GO Biological Process terms."}
+if(nrow(gsea_BP) >= 3) {
+  gseaplot2(gsea_BP, geneSetID = 1:3, title = "Top 3 Enriched GO BP Terms")
+}
+```
+
+### GO Molecular Function
+```{r gsea-mf}
+gsea_MF <- gseGO(geneList = gene_list_entrez,
+                 OrgDb = org.Hs.eg.db,
+                 ont = "MF",
+                 minGSSize = 10,
+                 maxGSSize = 500,
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod = "BH",
+                 verbose = FALSE)
+
+n_gsea_mf <- nrow(gsea_MF)
+```
+
+### GO Cellular Component
+```{r gsea-cc}
+# Run GSEA on GO Cellular Component terms
+# CC tells us where in the cell the gene products are located
+gsea_CC <- gseGO(geneList = gene_list_entrez,
+                 OrgDb = org.Hs.eg.db,
+                 ont = "CC",                 # Cellular Component
+                 minGSSize = 10,             
+                 maxGSSize = 500,            
+                 pvalueCutoff = 0.05,
+                 pAdjustMethod = "BH",
+                 verbose = FALSE)
+
+# Count significant CC terms
+n_gsea_cc <- nrow(gsea_CC)
+```
+
+## GSEA - KEGG Pathways
+```{r gsea-kegg}
+# Run GSEA on KEGG pathways using all genes ranked by fold change
+# Unlike ORA, GSEA doesn't need a cutoff - it uses the full ranked list
+gsea_KEGG <- gseKEGG(geneList = gene_list_entrez,
+                     organism = "hsa",           # human
+                     minGSSize = 10,             
+                     maxGSSize = 500,            
+                     pvalueCutoff = 0.05,
+                     pAdjustMethod = "BH",
+                     verbose = FALSE)
+
+# Count how many significant pathways were found
+n_gsea_kegg <- nrow(gsea_KEGG)
+```
+
+Figure 31 shows GSEA results for KEGG pathways. Activated pathways include immune-related ones like Coronavirus disease, Toll-like receptor signaling, and chemokine signaling. Suppressed pathways include Ribosome, Oxidative phosphorylation, and several disease pathways that share mitochondrial genes.
+
+```{r gsea-kegg-dotplot, fig.height=8, fig.cap="**Figure 31:** GSEA results for KEGG pathways, split by direction of enrichment."}
+# Dotplot of GSEA KEGG results split by activation/suppression
+# Shows pathway significance (color) and gene count (size)
+if(nrow(gsea_KEGG) > 0) {
+  dotplot(gsea_KEGG, showCategory = 15, title = "GSEA: KEGG Pathways", split = ".sign") +
+    facet_grid(.~.sign)
+}
+```
+Figure 32 shows fold change distributions for KEGG pathways. Cytokine-related pathways (top, blue) are shifted toward positive values, while Ribosome and Oxidative phosphorylation (bottom, red) are shifted negative. The Coronavirus disease pathway shows a mixed distribution.
+```{r gsea-kegg-ridge, fig.height=8, fig.cap="**Figure 32:** Ridge plot showing the distribution of fold changes for genes in each enriched KEGG pathway."}
+# Ridge plot showing fold change distribution for KEGG pathways
+# This helps visualize which pathways are up vs down regulated
+if(nrow(gsea_KEGG) > 0) {
+  ridgeplot(gsea_KEGG, showCategory = 15) + 
+    ggtitle("GSEA: KEGG Pathways - Ridge Plot")
+}
+```
+Figure 33 shows GSEA enrichment plots for the top 3 KEGG pathways. All three (Ribosome, Oxidative phosphorylation, Parkinson disease) show negative enrichment scores, with genes concentrated at the right side of the ranked list. This confirms that these pathways are suppressed in COVID patients.
+
+```{r gsea-kegg-plot, fig.cap="**Figure 33:** GSEA enrichment plots for the top 3 enriched KEGG pathways."}
+# Plot GSEA enrichment curves for top 3 KEGG pathways
+# Shows running enrichment score and where pathway genes fall in ranked list
+if(nrow(gsea_KEGG) >= 3) {
+  gseaplot2(gsea_KEGG, geneSetID = 1:3, title = "Top 3 Enriched KEGG Pathways")
+}
+```
+
+## Enrichment Analysis Summary
+Table 11 summarizes all enrichment results. GSEA consistently identified more enriched terms than ORA across all categories, which is expected since GSEA uses all genes rather than just significant ones. GO Biological Process had the most enriched terms in both methods.
+
+**Table 11: Summary of Functional Enrichment Results**
+```{r enrichment-summary-table}
+# Create summary table comparing ORA vs GSEA results
+# This helps readers quickly see how many terms each method identified
+enrichment_summary <- data.frame(
+  Analysis = c("ORA", "ORA", "ORA", "ORA", "GSEA", "GSEA", "GSEA", "GSEA"),
+  Category = c("GO Biological Process", "GO Molecular Function", "GO Cellular Component", "KEGG Pathways",
+               "GO Biological Process", "GO Molecular Function", "GO Cellular Component", "KEGG Pathways"),
+  Enriched_Terms = c(n_bp_ora, n_mf_ora, n_cc_ora, n_kegg_ora,
+                     n_gsea_bp, n_gsea_mf, n_gsea_cc, n_gsea_kegg)
+)
+
+# Display as formatted table
+knitr::kable(enrichment_summary, 
+             col.names = c("Analysis Type", "Category", "Enriched Terms"),
+             row.names = FALSE)
+```
+
+## Key Biological Findings
+
+Based on the enrichment analyses, the following biological themes emerge:
+
+**Upregulated in COVID-19:**
+
+- Defense response to virus
+- Type I interferon signaling pathway
+- Response to interferon-gamma
+- Cytokine-mediated signaling
+
+**Downregulated in COVID-19:**
+
+- Cytoplasmic translation
+- Ribosome biogenesis
+- Oxidative phosphorylation
+- Cilium movement and assembly
+
+## Export Results
+```{r export-enrichment, eval=FALSE, echo=TRUE}
+# Export ORA results
+write.csv(as.data.frame(ego_BP), file = "GO_BP_ORA_results.csv", row.names = FALSE)
+write.csv(as.data.frame(ego_MF), file = "GO_MF_ORA_results.csv", row.names = FALSE)
+write.csv(as.data.frame(ego_CC), file = "GO_CC_ORA_results.csv", row.names = FALSE)
+write.csv(as.data.frame(kegg_ora), file = "KEGG_ORA_results.csv", row.names = FALSE)
+
+# Export GSEA results
+write.csv(as.data.frame(gsea_BP), file = "GO_BP_GSEA_results.csv", row.names = FALSE)
+write.csv(as.data.frame(gsea_MF), file = "GO_MF_GSEA_results.csv", row.names = FALSE)
+write.csv(as.data.frame(gsea_CC), file = "GO_CC_GSEA_results.csv", row.names = FALSE)
+write.csv(as.data.frame(gsea_KEGG), file = "KEGG_GSEA_results.csv", row.names = FALSE)
+```
+
+```{r export-excel, eval=FALSE, echo=TRUE}
+library(writexl)
+
+results_list <- list(
+  "DE_Results_Full" = results_sv,
+  "DE_Significant" = results_sv[results_sv$FDR < 0.05 & abs(results_sv$logFC) > 1, ],
+  "GO_BP_ORA" = as.data.frame(ego_BP),
+  "GO_MF_ORA" = as.data.frame(ego_MF),
+  "GO_CC_ORA" = as.data.frame(ego_CC),
+  "KEGG_ORA" = as.data.frame(kegg_ora),
+  "GO_BP_GSEA" = as.data.frame(gsea_BP),
+  "KEGG_GSEA" = as.data.frame(gsea_KEGG)
+)
+
+write_xlsx(results_list, "COVID_RNAseq_Final_Results.xlsx")
+```
+
+## Functional Enrichment Summary
+
+1. **ORA identified** `r n_bp_ora` GO BP terms, `r n_mf_ora` GO MF terms, `r n_cc_ora` GO CC terms, and `r n_kegg_ora` KEGG pathways
+2. **GSEA identified** `r n_gsea_bp` GO BP terms, `r n_gsea_mf` GO MF terms, `r n_gsea_cc` GO CC terms, and `r n_gsea_kegg` KEGG pathways
+3. **Key upregulated processes:** Antiviral defense, interferon signaling, immune response
+4. **Key downregulated processes:** Translation, ribosome function, oxidative phosphorylation
+5. **Results consistent with** published COVID-19 transcriptomic signatures
+
+
+
+# Discussion
+
+## Biological Interpretation
+
+This analysis of the GSE152075 dataset revealed significant transcriptional changes in COVID-19 patients compared to healthy controls. A total of `r format(de_fdr05_lfc1, big.mark = ",")` genes were identified as differentially expressed (FDR < 0.05 and |log2FC| > 1), with `r format(up_count, big.mark = ",")` upregulated and `r format(down_count, big.mark = ",")` downregulated.
+
+The functional enrichment analysis showed two main biological patterns. First, genes involved in antiviral immune response were strongly upregulated, including interferon-stimulated genes (IFI44L, OAS2, IFIT1, MX1) and chemokines. Second, ribosomal protein genes and translation-related genes were downregulated, suggesting the virus may be interfering with host protein synthesis - a common viral strategy to hijack cell machinery.
+
+## Comparison with Original Publication
+
+The results are largely consistent with Lieberman et al. [@lieberman2020vivo], who also found interferon-driven antiviral response and downregulation of ribosomal proteins. Despite using different methods (DESeq2 vs edgeR), the main biological conclusions are the same, suggesting these findings are robust across statistical approaches. One difference is that the original study examined gene expression changes with viral load, age, and sex, while this analysis focused only on COVID-positive versus negative comparison.
+
+## Limitations
+
+Several limitations should be considered: (1) samples are only from nasopharyngeal swabs, so findings may not reflect responses in other tissues; (2) no batch information was available, so SVA was used to estimate hidden variation; (3) no information about disease severity was available; and (4) bulk RNA-seq captures mixed cell types, limiting cell-type-specific insights.
+
+## Conclusion
+
+This reanalysis successfully identified differentially expressed genes and enriched pathways associated with COVID-19 infection. The main findings - upregulation of interferon-stimulated genes and downregulation of ribosomal proteins - are consistent with the original publication, providing confidence that these biological conclusions are robust across analytical methods.
+
+
+**GitHub repository:** https://github.com/Alex05a/FinalProjectBIOS658
+
+
+**APPENDIX**
+```{r ref.label=knitr::all_labels(), echo=TRUE,eval=FALSE}
+
+```
+
+# References
