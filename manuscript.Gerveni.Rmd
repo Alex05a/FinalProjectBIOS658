@@ -85,7 +85,7 @@ library(pheatmap)
 
 ```{r load-data}
 # Load the counts matrix
-counts <- read.delim("C:/Users/gervenia/OneDrive - Virginia Commonwealth University/Desktop/FINAL PROJECT 2025/GSE152075_raw_counts_GEO.txt/GSE152075_raw_counts_GEO.txt", 
+counts <- read.delim("C:/Users/gervenia/OneDrive - Virginia Commonwealth University/Desktop/Dr. Dozmorov/FinalProjectBIOS658/GSE152075_raw_counts_GEO.txt", 
                      sep = " ",
                      row.names = 1)
 ```
